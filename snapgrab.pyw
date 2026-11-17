@@ -501,7 +501,9 @@ class SnapGrabApp:
         seg = tk.Frame(hdr, bg=T.BG)
         seg.pack(side="left", padx=(22, 0))
         self._nav = {}
-        for key, label in (("library", "▦  Library"), ("download", "⬇  Download")):
+        for key, label in (("library", "▦  Library"), ("images", "◩  Images"),
+                           ("music", "♪  Music"), ("docs", "▤  Docs"),
+                           ("download", "⬇  Download")):
             b = tk.Label(seg, text=label, font=("Segoe UI Semibold", 9), bg=T.BG,
                          fg=T.MUTED, cursor="hand2", padx=12, pady=5)
             b.pack(side="left", padx=(0, 6))
@@ -518,9 +520,13 @@ class SnapGrabApp:
         self._build_download_view(self.download_view)
 
         self._build_library_view()   # sets self.library_view (or None)
+        self.music_view = None       # built on first visit (keeps startup fast)
+        self.docs_view = None        # same
+        self.images_view = None      # same
 
         if self.library_view is None:
-            self._nav["library"].pack_forget()
+            for k in ("library", "images", "music", "docs"):
+                self._nav[k].pack_forget()
         self._show_view("library" if self.library_view is not None else "download")
 
     def _build_library_view(self):
@@ -538,16 +544,89 @@ class SnapGrabApp:
         except Exception:
             self.library_view = None
 
+    def _build_music_view(self):
+        # default first tab: Windows' Music folder, else the download folder
+        folder = os.path.join(os.path.expanduser("~"), "Music")
+        if not os.path.isdir(folder):
+            folder = self.output_dir
+        try:
+            import snapgrab_media
+            # Music itself often holds only album folders — then open the
+            # first subfolder that actually has songs
+            def has_songs(d):
+                try:
+                    return any(f.lower().endswith(snapgrab_media.AUDIO_EXTS)
+                               for f in os.listdir(d))
+                except Exception:
+                    return False
+            if not has_songs(folder):
+                for name in sorted(os.listdir(folder)):
+                    sub = os.path.join(folder, name)
+                    if os.path.isdir(sub) and has_songs(sub):
+                        folder = sub
+                        break
+            if snapgrab_media.have_pillow():
+                self.music_view = snapgrab_media.LibraryView(self.content, folder,
+                                                             kind="music")
+        except Exception:
+            self.music_view = None
+
+    def _build_docs_view(self):
+        # default first tab: Windows' Documents folder, else the download folder
+        folder = os.path.join(os.path.expanduser("~"), "Documents")
+        if not os.path.isdir(folder):
+            folder = self.output_dir
+        try:
+            import snapgrab_media
+            if snapgrab_media.have_pillow():
+                self.docs_view = snapgrab_media.LibraryView(self.content, folder,
+                                                            kind="docs")
+        except Exception:
+            self.docs_view = None
+
+    def _build_images_view(self):
+        # default first tab: Windows' Pictures folder (or its first subfolder
+        # with images, e.g. Screenshots, if Pictures itself has none)
+        folder = os.path.join(os.path.expanduser("~"), "Pictures")
+        if not os.path.isdir(folder):
+            folder = self.output_dir
+        try:
+            import snapgrab_media
+            exts = snapgrab_media.IMAGE_EXTS
+
+            def has_images(d):
+                try:
+                    return any(f.lower().endswith(exts) for f in os.listdir(d))
+                except Exception:
+                    return False
+            if not has_images(folder):
+                for name in sorted(os.listdir(folder)):
+                    sub = os.path.join(folder, name)
+                    if os.path.isdir(sub) and has_images(sub):
+                        folder = sub
+                        break
+            if snapgrab_media.have_pillow():
+                # Windows-Photos-style justified grid (real shapes, month headings)
+                self.images_view = snapgrab_media.ImageGridView(self.content, folder)
+        except Exception:
+            self.images_view = None
+
     def _show_view(self, key):
-        if key == "library" and self.library_view is None:
+        if key == "music" and self.music_view is None:
+            self._build_music_view()
+        if key == "docs" and self.docs_view is None:
+            self._build_docs_view()
+        if key == "images" and self.images_view is None:
+            self._build_images_view()
+        views = {"library": self.library_view, "music": self.music_view,
+                 "docs": self.docs_view, "images": self.images_view,
+                 "download": self.download_view}
+        if views.get(key) is None:
             key = "download"
-        self.download_view.pack_forget()
-        if self.library_view is not None:
-            self.library_view.pack_forget()
-        if key == "library":
-            self.library_view.pack(fill="both", expand=True)
-        else:
-            self.download_view.pack(fill="both", expand=True)
+        for v in views.values():
+            if v is not None:
+                v.pack_forget()
+        views[key].pack(fill="both", expand=True)
         for k, b in self._nav.items():
             active = (k == key)
             b.config(fg=T.TEXT if active else T.MUTED, bg=T.SURFACE if active else T.BG)
@@ -643,9 +722,17 @@ class SnapGrabApp:
 
         # Log
         self.log_shown = False
-        self.log_hdr = tk.Label(form, text="Show log", font=F_SMALL, bg=T.BG,
+        log_row = tk.Frame(form, bg=T.BG)
+        log_row.pack(fill="x", pady=(12, 0))
+        self.log_hdr = tk.Label(log_row, text="Show log", font=F_SMALL, bg=T.BG,
                                 fg=T.DIM, anchor="w", cursor="hand2")
-        self.log_hdr.pack(fill="x", pady=(12, 0))
+        self.log_hdr.pack(side="left")
+        # "⧉ Copy log" — shown only while the log is open
+        self.log_copy = tk.Label(log_row, text="⧉  Copy log", font=F_SMALL, bg=T.BG,
+                                 fg=T.DIM, cursor="hand2")
+        self.log_copy.bind("<Button-1>", lambda e: self._copy_log())
+        self.log_copy.bind("<Enter>", lambda e: self.log_copy.config(fg=T.MUTED))
+        self.log_copy.bind("<Leave>", lambda e: self.log_copy.config(fg=T.DIM))
         self.log_hdr.bind("<Button-1>", lambda e: self._toggle_log())
         self.log_hdr.bind("<Enter>", lambda e: self.log_hdr.config(fg=T.MUTED))
         self.log_hdr.bind("<Leave>", lambda e: self.log_hdr.config(fg=T.DIM))
@@ -656,8 +743,13 @@ class SnapGrabApp:
                                 relief="flat", bd=0, wrap="word", height=6,
                                 insertbackground=T.TEXT, state="disabled",
                                 selectbackground=T.SELECT, selectforeground=T.TEXT)
-        log_sb = tk.Scrollbar(self.log_frame, command=self.log_text.yview,
-                              bg=T.SURFACE, troughcolor=T.SURFACE, width=8)
+        try:        # slim dark scrollbar (falls back to the native one)
+            from snapgrab_media import SlimScrollbar
+            log_sb = SlimScrollbar(self.log_frame, command=self.log_text.yview,
+                                   bg=T.SURFACE, size=10)
+        except Exception:
+            log_sb = tk.Scrollbar(self.log_frame, command=self.log_text.yview,
+                                  bg=T.SURFACE, troughcolor=T.SURFACE, width=8)
         self.log_text.configure(yscrollcommand=log_sb.set)
         log_sb.pack(side="right", fill="y", padx=(0, 2), pady=4)
         self.log_text.pack(side="left", fill="both", expand=True, padx=10, pady=8)
@@ -707,8 +799,15 @@ class SnapGrabApp:
             pass  # no network / already busy — never block the UI over this
 
     def _browse(self):
-        f = filedialog.askdirectory(initialdir=self.dir_var.get())
-        if f: self.dir_var.set(f)
+        # folder picker runs in its own process so a stalled Explorer add-on
+        # (Dropbox / Drive / network) can't freeze SnapGrab — see snapgrab_media
+        try:
+            import snapgrab_media
+            snapgrab_media.pick_folder(self.root, self.dir_var.get(),
+                                       self.dir_var.set, title="Choose download folder")
+        except Exception:
+            f = filedialog.askdirectory(initialdir=self.dir_var.get())
+            if f: self.dir_var.set(f)
 
     def _paste_clip(self, _=None):
         try:
@@ -719,11 +818,24 @@ class SnapGrabApp:
     def _toggle_log(self):
         if self.log_shown:
             self.log_frame.pack_forget()
+            self.log_copy.pack_forget()
             self.log_hdr.config(text="Show log")
         else:
             self.log_frame.pack(fill="both", expand=True, pady=(6, 0))
+            self.log_copy.pack(side="right")
             self.log_hdr.config(text="Hide log")
         self.log_shown = not self.log_shown
+
+    def _copy_log(self):
+        text = self.log_text.get("1.0", "end-1c").strip()
+        if not text:
+            self.log_copy.config(text="Log is empty")
+        else:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update()          # keep it on the clipboard after focus moves
+            self.log_copy.config(text="✓  Copied")
+        self.root.after(1400, lambda: self.log_copy.config(text="⧉  Copy log"))
 
     def _log(self, msg, auto_show=True):
         self.log_text.config(state="normal")

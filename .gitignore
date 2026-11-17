@@ -6,6 +6,8 @@ yt-dlp.exe
 
 # personal / machine-specific files
 snapgrab_tabs.json
+snapgrab_*tabs.json
+*.testbak
 snapgrab_debug.txt
 cookies.txt
 *.lnk

@@ -3,3 +3,4 @@ python-vlc
 python-mpv
 pywebview
 gallery-dl
+pypdfium2
