@@ -1,0 +1,5 @@
+Pillow
+python-vlc
+python-mpv
+pywebview
+gallery-dl

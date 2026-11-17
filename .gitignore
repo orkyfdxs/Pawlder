@@ -1,0 +1,18 @@
+# bundled third-party engines (installed locally, see README)
+snapgrab_libs/
+yt-dlp.exe
+*.dll
+*.exe
+
+# personal / machine-specific files
+snapgrab_tabs.json
+snapgrab_debug.txt
+cookies.txt
+*.lnk
+
+# caches and leftovers
+.snapgrab_thumbs/
+__pycache__/
+*.pyc
+*.bak
+*.zip
