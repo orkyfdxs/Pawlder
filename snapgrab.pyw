@@ -409,7 +409,7 @@ class Switch(tk.Canvas):
 class SnapGrabApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("SnapGrab")
+        self.root.title("Pawlder")
         self.root.configure(bg=T.BG)
         self.root.resizable(True, True)
         self.root.minsize(660, 560)
@@ -494,7 +494,7 @@ class SnapGrabApp:
         # Header with Library / Download toggle
         hdr = tk.Frame(outer, bg=T.BG)
         hdr.pack(fill="x", padx=24, pady=(16, 8))
-        tk.Label(hdr, text="SnapGrab", font=F_TITLE, bg=T.BG, fg=T.TEXT).pack(side="left")
+        tk.Label(hdr, text="Pawlder", font=F_TITLE, bg=T.BG, fg=T.TEXT).pack(side="left")
         self.hdr_note = tk.Label(hdr, text=f"v{APP_VERSION}", font=F_SMALL, bg=T.BG, fg=T.DIM)
         self.hdr_note.pack(side="right")
 
@@ -888,11 +888,11 @@ class SnapGrabApp:
             return
         url = self.url_var.get().strip()
         if not url:
-            messagebox.showwarning("SnapGrab", "Paste a video URL first.")
+            messagebox.showwarning("Pawlder", "Paste a video URL first.")
             return
         out = self.dir_var.get().strip()
         if not os.path.isdir(out):
-            messagebox.showwarning("SnapGrab", "Output folder doesn't exist.")
+            messagebox.showwarning("Pawlder", "Output folder doesn't exist.")
             return
 
         qk = self.quality_var.get()

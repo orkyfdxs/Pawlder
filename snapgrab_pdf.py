@@ -75,11 +75,48 @@ def _geometry(argv):
     return wa.left + (sw - w) // 2, wa.top + (sh - h) // 2, w, h
 
 
-def _dark_titlebar(window):
-    """Dark native title bar + SnapGrab icon (WinForms window underneath)."""
+# NOTE: never touch window.native (the .NET WinForms form) from pywebview's
+# event threads. Getting/setting its properties from a non-UI thread goes
+# through pythonnet while holding the GIL; if the UI thread meanwhile needs
+# Python, both wait forever — the viewer froze "Not Responding" that way
+# (light title bar + default icon = it hung right here). Use plain Win32 via
+# ctypes instead: ctypes releases the GIL, and PostMessage never blocks.
+_ICONS = []                                      # keep icon handles alive
+
+
+def _find_hwnd(title, timeout=3.0):
+    """Our own top-level window with this title (pure Win32)."""
+    import ctypes
+    from ctypes import wintypes
+    u = ctypes.windll.user32
+    me = os.getpid()
+    end = time.time() + timeout
+    while time.time() < end:
+        found = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        def cb(h, _):
+            pid = wintypes.DWORD()
+            u.GetWindowThreadProcessId(h, ctypes.byref(pid))
+            if pid.value == me:
+                b = ctypes.create_unicode_buffer(512)
+                u.GetWindowTextW(h, b, 512)
+                if b.value == title:
+                    found.append(h)
+            return True
+        u.EnumWindows(cb, 0)
+        if found:
+            return found[0]
+        time.sleep(0.05)
+    return None
+
+
+def _style_window(hwnd):
+    """Dark native title bar + SnapGrab icon, without touching .NET."""
+    import ctypes
+    if not hwnd:
+        return
     try:
-        import ctypes
-        hwnd = window.native.Handle.ToInt32()
         val = ctypes.c_int(1)
         ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(val),
                                                    ctypes.sizeof(val))
@@ -88,8 +125,17 @@ def _dark_titlebar(window):
     try:
         ico = os.path.join(_HERE, "snapgrab.ico")
         if os.path.isfile(ico):
-            import System.Drawing as SD
-            window.native.Icon = SD.Icon(ico)
+            u = ctypes.windll.user32
+            u.LoadImageW.restype = ctypes.c_void_p
+            u.LoadImageW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint,
+                                     ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+            u.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p,
+                                       ctypes.c_void_p]
+            for which, size in ((1, 32), (0, 16)):          # ICON_BIG, ICON_SMALL
+                h = u.LoadImageW(None, ico, 1, size, size, 0x10)  # LR_LOADFROMFILE
+                if h:
+                    _ICONS.append(h)
+                    u.PostMessageW(hwnd, 0x0080, which, h)     # WM_SETICON (async)
     except Exception:
         pass
 
@@ -119,10 +165,12 @@ def _alive(pid):
         k.CloseHandle(h)
 
 
-def _to_front(win):
+def _to_front(hwnd):
+    """Bring our window forward — pure Win32 (see the note above)."""
+    if not hwnd:
+        return
     try:
         import ctypes
-        hwnd = win.native.Handle.ToInt32()
         u = ctypes.windll.user32
         u.ShowWindow(hwnd, 9)                   # SW_RESTORE
         u.SetForegroundWindow(hwnd)
@@ -152,11 +200,12 @@ def main():
     win = webview.create_window(os.path.basename(path), Path(path).as_uri(),
                                 x=x, y=y, width=w, height=h,
                                 background_color=BG, text_select=True)
-    state = {"hidden_since": None, "quitting": False}
+    state = {"hidden_since": None, "quitting": False, "hwnd": None}
     loaded = threading.Event()
 
     def on_shown():
-        _dark_titlebar(win)
+        state["hwnd"] = _find_hwnd(os.path.basename(path))
+        _style_window(state["hwnd"])
         if os.environ.get("SNAPGRAB_PDF_TIMING"):
             print(f"shown {time.perf_counter() - _T0:.2f}s", flush=True)
 
@@ -188,7 +237,7 @@ def main():
         loaded.wait(1.5)
         state["hidden_since"] = None
         win.show()
-        _to_front(win)
+        _to_front(state["hwnd"])
 
     def serve():
         while True:
@@ -198,17 +247,17 @@ def main():
                 return                           # listener closed → quitting
             try:
                 msg = conn.recv()
-                conn.send("ok")                  # reply first: SnapGrab never waits on us
+                ok = isinstance(msg, dict) and os.path.isfile(msg.get("open", ""))
+                if ok:
+                    open_pdf(msg["open"], msg.get("geo") or [])
+                # reply only once the PDF is showing: if this window ever
+                # freezes, SnapGrab gets no answer and replaces the viewer
+                conn.send("ok" if ok else "bad")
             except Exception:
-                msg = None
+                pass
             finally:
                 try:
                     conn.close()
-                except Exception:
-                    pass
-            if isinstance(msg, dict) and os.path.isfile(msg.get("open", "")):
-                try:
-                    open_pdf(msg["open"], msg.get("geo") or [])
                 except Exception:
                     pass
 
@@ -236,12 +285,29 @@ def main():
 
     def started():
         if listener is not None:
+            # SnapGrab reads this to replace us if we ever stop answering
+            try:
+                d = os.path.join(os.environ.get("LOCALAPPDATA", _tmp), "SnapGrab")
+                os.makedirs(d, exist_ok=True)
+                with open(os.path.join(d, "pdfviewer.pid"), "w") as f:
+                    f.write(str(os.getpid()))
+            except Exception:
+                pass
             threading.Thread(target=serve, daemon=True).start()
             threading.Thread(target=watchdog, daemon=True).start()
 
     # keep WebView2's profile (not private) so later opens start warmer
     store = os.path.join(os.environ.get("LOCALAPPDATA", _tmp), "SnapGrab", "webview")
     webview.start(started, private_mode=False, storage_path=store)
+    if listener is not None:                      # we were the shared viewer:
+        try:                                      # retire our pid file so a
+            pidf = os.path.join(os.environ.get("LOCALAPPDATA", _tmp),   # reused
+                                "SnapGrab", "pdfviewer.pid")            # pid is
+            with open(pidf) as f:                                       # never
+                if f.read().strip() == str(os.getpid()):                # mistaken
+                    os.remove(pidf)                                     # for us
+        except Exception:
+            pass
     os._exit(0)                                   # don't wait on the pipe thread
 
 

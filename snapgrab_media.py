@@ -763,6 +763,8 @@ class LibraryView(tk.Frame):
         sb.pack(side="right", fill="y")
         self.canvas.pack(side="left", fill="both", expand=True)
         self.canvas.bind("<Configure>", self._on_canvas_resize)
+        self._press = None           # (x_root, y_root, path) of the last left-press
+        self._dragged = False
         # scope wheel scrolling to when the pointer is over the grid, so it
         # doesn't fight the Download view when they share one window
         self.canvas.bind("<Enter>", lambda e: self.canvas.bind_all("<MouseWheel>", self._on_wheel))
@@ -1026,10 +1028,6 @@ class LibraryView(tk.Frame):
         slot = {"tag": tag, "rect": rect, "bg": bg, "imgitem": img, "dots": dots, "name": name,
                 "path": None, "img": None, "x": 0, "y": 0, "shown": False}
 
-        def on_click(e, s=slot):
-            if s["path"]:
-                self.play(s["path"])
-
         def on_ctx(e, s=slot):
             if s["path"]:
                 self._show_ctx(e, s["path"])
@@ -1041,7 +1039,9 @@ class LibraryView(tk.Frame):
         def on_leave(e, s=slot):
             c.itemconfigure(s["rect"], fill=T.CARD)
             c.configure(cursor="")
-        c.tag_bind(tag, "<Button-1>", on_click)
+        # open on RELEASE without moving (press + slide away = no open)
+        c.tag_bind(tag, "<ButtonPress-1>", lambda e, s=slot: self._card_press(e, s))
+        c.tag_bind(tag, "<ButtonRelease-1>", lambda e, s=slot: self._card_release(e, s))
         c.tag_bind(tag, "<Button-3>", on_ctx)
         c.tag_bind(tag, "<Enter>", on_enter)
         c.tag_bind(tag, "<Leave>", on_leave)
@@ -1081,6 +1081,22 @@ class LibraryView(tk.Frame):
             self._cache.move_to_end(path)       # recently seen
         if slot["img"] is not img:
             self._set_slot_image(slot, img)
+
+    # ── click vs drag ──────────────────────────────────────────────────
+    # A click (press + release without moving) opens the file; pressing and
+    # sliding off does nothing, so a stray drag never opens anything.
+    CLICK_SLOP = 5               # px the mouse may wobble and still be a click
+
+    def _card_press(self, e, slot):
+        self._press = (e.x_root, e.y_root, slot["path"])
+        self._dragged = False
+
+    def _card_release(self, e, slot):
+        p, self._press = self._press, None
+        if self._dragged or not p or not p[2] or p[2] != slot["path"]:
+            return
+        if abs(e.x_root - p[0]) <= self.CLICK_SLOP and abs(e.y_root - p[1]) <= self.CLICK_SLOP:
+            self.play(p[2])
 
     def _fit_name(self, name):
         """Cut a file name to the card's width in real pixels (a character
@@ -1495,7 +1511,7 @@ class LibraryView(tk.Frame):
             return
         except Exception as e:
             import tkinter.messagebox as mb
-            mb.showerror("SnapGrab", f"Couldn't open player:\n{e}\n\nOpening externally.")
+            mb.showerror("Pawlder", f"Couldn't open player:\n{e}\n\nOpening externally.")
             try:
                 os.startfile(path)
             except Exception:
@@ -1667,24 +1683,27 @@ def open_pdf(parent, path):
         pass
 
     def work():
-        global _pdf_last_launch
+        global _pdf_launched
         import time as _t
-        # 1) a viewer is already running (maybe hidden) → just hand it the file
-        #    (if one was launched seconds ago, give it time to start listening)
-        deadline = _t.time() + (6 if _t.time() - _pdf_last_launch < 6 else 0)
+        # 1) a viewer is already running (maybe hidden) → just hand it the file.
+        #    If we launched one moments ago and it's STILL starting up, give it
+        #    up to 6 s to begin listening; if it already exited, don't wait.
+        t0 = _t.time()
         while True:
             if _pdf_send(path, geo):
                 return
-            if _t.time() >= deadline:
+            starting = (_pdf_launched is not None and _pdf_launched.poll() is None
+                        and not _pdf_viewer_pid())
+            if not starting or _t.time() - t0 > 6:
                 break
             _t.sleep(0.1)
         # 2) none running → start one (it becomes the shared viewer)
         try:
-            _pdf_last_launch = _t.time()
             # NOTE: no startupinfo=_no_window() — SW_HIDE would be applied to
             # the viewer's first window and keep it invisible.
-            subprocess.Popen([_pythonw(), PDF_HELPER, path] + [str(v) for v in geo]
-                             + [str(os.getpid())], cwd=SCRIPT_DIR)
+            _pdf_launched = subprocess.Popen(
+                [_pythonw(), PDF_HELPER, path] + [str(v) for v in geo]
+                + [str(os.getpid())], cwd=SCRIPT_DIR)
         except Exception:
             try:
                 os.startfile(path)
@@ -1698,11 +1717,71 @@ def open_pdf(parent, path):
 _PDF_PIPE = r"\\.\pipe\snapgrab-pdf-" + "".join(
     c for c in (os.environ.get("USERNAME") or "user") if c.isalnum())
 _PDF_AUTH = b"snapgrab-pdf-v1"
-_pdf_last_launch = 0.0
+_pdf_launched = None              # Popen of the viewer we last started
+
+
+_PDF_PIDFILE = os.path.join(os.environ.get("LOCALAPPDATA") or SCRIPT_DIR,
+                            "SnapGrab", "pdfviewer.pid")
+
+
+def _pdf_viewer_pid():
+    try:
+        with open(_PDF_PIDFILE) as f:
+            return int(f.read().strip())
+    except Exception:
+        return 0
+
+
+def _pdf_viewer_hung(pid):
+    """True if any window of the viewer process is frozen ("Not Responding")."""
+    if not pid:
+        return False
+    from ctypes import wintypes
+    u = ctypes.windll.user32
+    u.IsHungAppWindow.argtypes = [wintypes.HWND]
+    hung = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    def cb(h, _):
+        p = wintypes.DWORD()
+        u.GetWindowThreadProcessId(h, ctypes.byref(p))
+        if p.value == pid and u.IsWindowVisible(h) and u.IsHungAppWindow(h):
+            hung.append(h)
+        return True
+    u.EnumWindows(cb, 0)
+    return bool(hung)
+
+
+def _kill_pdf_viewer(pid):
+    """End a frozen viewer — only if that pid really is a Python process
+    (never kill something else that reused the number)."""
+    if not pid or pid == os.getpid():
+        return
+    k = ctypes.windll.kernel32
+    h = k.OpenProcess(0x0001 | 0x1000, False, pid)   # TERMINATE | QUERY_LIMITED
+    if not h:
+        return
+    try:
+        buf = ctypes.create_unicode_buffer(260)
+        n = ctypes.c_ulong(260)
+        if k.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)) and \
+                os.path.basename(buf.value).lower() in ("pythonw.exe", "python.exe"):
+            k.TerminateProcess(h, 1)
+    finally:
+        k.CloseHandle(h)
+    try:
+        os.remove(_PDF_PIDFILE)
+    except Exception:
+        pass
 
 
 def _pdf_send(path, geo):
-    """Hand a PDF to the running viewer. False if none is listening."""
+    """Hand a PDF to the running viewer. False if none is listening — or if
+    it is frozen, in which case it's closed so a fresh one gets started."""
+    pid = _pdf_viewer_pid()
+    if _pdf_viewer_hung(pid):
+        _kill_pdf_viewer(pid)
+        return False
     try:
         from multiprocessing.connection import Client
         c = Client(_PDF_PIPE, family="AF_PIPE", authkey=_PDF_AUTH)
@@ -1710,7 +1789,11 @@ def _pdf_send(path, geo):
         return False
     try:
         c.send({"open": path, "geo": geo})
-        return c.recv() == "ok"
+        # the viewer answers once the PDF is on screen (~0.1-1.5 s)
+        if c.poll(8):
+            return c.recv() == "ok"
+        _kill_pdf_viewer(pid)            # no answer → frozen: replace it
+        return False
     except Exception:
         return False
     finally:
@@ -2455,10 +2538,6 @@ class ImageGridView(LibraryView):
         slot = {"tag": tag, "rect": bg, "imgitem": img, "path": None, "img": None,
                 "x": 0, "y": 0, "wh": (0, 0), "shown": False}
 
-        def on_click(e, s=slot):
-            if s["path"]:
-                self.play(s["path"])
-
         def on_ctx(e, s=slot):
             if s["path"]:
                 self._show_ctx(e, s["path"])
@@ -2484,7 +2563,9 @@ class ImageGridView(LibraryView):
             for it in (self._hov, self._hov_bg, self._hov_txt):
                 c.itemconfigure(it, state="hidden")
             c.configure(cursor="")
-        c.tag_bind(tag, "<Button-1>", on_click)
+        # open on RELEASE without moving (press + slide away = no open)
+        c.tag_bind(tag, "<ButtonPress-1>", lambda e, s=slot: self._card_press(e, s))
+        c.tag_bind(tag, "<ButtonRelease-1>", lambda e, s=slot: self._card_release(e, s))
         c.tag_bind(tag, "<Button-3>", on_ctx)
         c.tag_bind(tag, "<Enter>", on_enter)
         c.tag_bind(tag, "<Leave>", on_leave)
@@ -2626,7 +2707,7 @@ def open_library(parent, folder):
     """Standalone Library window (kept for convenience; the app embeds a
     LibraryView directly)."""
     win = tk.Toplevel(parent)
-    win.title("SnapGrab — Library")
+    win.title("Pawlder — Library")
     win.configure(bg=T.BG)
     win.geometry("900x640")
     win.minsize(560, 400)

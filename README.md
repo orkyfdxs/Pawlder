@@ -1,4 +1,6 @@
-# SnapGrab
+# Pawlder
+
+*(formerly SnapGrab — the code files keep their `snapgrab*` names)*
 
 A minimal Windows app that downloads videos from **YouTube, Instagram and Pinterest**, and browses your **videos, images, music and documents** in fast, light libraries with built-in players and viewers.
 
@@ -45,17 +47,18 @@ Built with Python + tkinter, on top of yt-dlp, gallery-dl, mpv, ffmpeg, Pillow, 
 ## Setup
 
 1. Clone or download this repo into a folder.
-2. Install the Python packages **into a `snapgrab_libs` folder next to the app**. SnapGrab loads its engines from there:
+2. Install the Python packages **into a `snapgrab_libs` folder next to the app**. Pawlder loads its engines from there:
    ```
    pip install --target snapgrab_libs -r requirements.txt
    ```
 3. Download [`yt-dlp.exe`](https://github.com/yt-dlp/yt-dlp/releases/latest) and put it next to `snapgrab.pyw`.
-4. For the mpv player: download the latest `mpv-dev-x86_64-*.7z` from [mpv-winbuild-cmake releases](https://github.com/shinchiro/mpv-winbuild-cmake/releases), extract `libmpv-2.dll`, and put it in `snapgrab_libs`. Without it, SnapGrab uses the VLC player instead.
+4. For the mpv player: download the latest `mpv-dev-x86_64-*.7z` from [mpv-winbuild-cmake releases](https://github.com/shinchiro/mpv-winbuild-cmake/releases), extract `libmpv-2.dll`, and put it in `snapgrab_libs`. Without it, Pawlder uses the VLC player instead.
 5. Run it:
    ```
    pythonw snapgrab.pyw
    ```
    For a desktop icon, make a Windows shortcut to `pythonw.exe "path\to\snapgrab.pyw"` and set its icon to `snapgrab.ico`.
+   To pin it to the taskbar, put that shortcut in your Start menu folder (`%APPDATA%\Microsoft\Windows\Start Menu\Programs`), search for it in Start and choose **Pin to taskbar**. (Pinning the running window would pin plain `pythonw.exe` instead.)
 
 > Tip: launch it through a shortcut like this rather than compiling it into an `.exe`. Freshly compiled launchers that start Python tend to get flagged by Windows Defender as a false positive.
 
