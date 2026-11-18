@@ -789,16 +789,18 @@ class LibraryView(tk.Frame):
         try:
             with open(self._config_path(), "r", encoding="utf-8") as f:
                 data = json.load(f)
-            folders = [d for d in data.get("folders", []) if os.path.isdir(d)]
+            saved = data.get("folders", [])
+            folders = [d for d in saved if os.path.isdir(d)]
             active = data.get("active", 0)
-            # always keep the download folder available as a tab (appended so
-            # the saved active index stays valid), but restore the last-viewed
-            # tab like a browser rather than forcing the download folder.
-            if default_folder and os.path.isdir(default_folder) and \
-                    self._tab_index(default_folder, folders) < 0:
-                folders.append(default_folder)
+            # The saved list is the user's choice — restore it exactly. (It used
+            # to re-add the default folder on every launch, so a tab you closed
+            # came back after a restart.) The default is only used on the very
+            # first run, or if every saved folder has since been deleted.
             if folders:
-                active = active if 0 <= active < len(folders) else 0
+                # keep the tab you were on, matched by folder (indexes shift
+                # if a saved folder was deleted)
+                was = saved[active] if isinstance(active, int) and 0 <= active < len(saved) else None
+                active = folders.index(was) if was in folders else 0
                 return folders, active
         except Exception:
             pass
