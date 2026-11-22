@@ -22,11 +22,11 @@ Built with Python + tkinter, on top of yt-dlp, gallery-dl, mpv, ffmpeg, Pillow, 
 - **Images**: a Windows-Photos-style justified layout — real aspect ratios, rows that fill the width, grouped by month
 - **Music**: album-art grid with track lengths (a ♪ tile when a song has no cover)
 - **Docs**: PDF first-page covers with page counts, text-file previews, and icons for everything else
-- Right-click any item: open, reveal in folder, open in default app, copy path
+- Secondary-click any item to show it in its folder; Shift + secondary-click for the menu (open, reveal, open in default app, copy path)
 
-**Viewers**
+**Viewers** — everything opens inside the main window, no extra windows to juggle. `Esc` or the window's ✕ goes back to the library, right where you were
 - **Images**: opens instantly inside the app; `←/→` next/previous (neighbours are preloaded), mouse wheel zooms at the cursor, drag to pan, `0` fit, `1` 100 %, `f` fullscreen; animated GIF/WebP; phone-photo rotation
-- **PDF**: Edge's PDF viewer (zoom, search, print) in its own window. The viewer stays alive in the background after the first PDF, so later ones open almost instantly; it quits by itself after 5 idle minutes
+- **PDF**: Edge's own PDF viewer (zoom, search, select text, print), hosted inside the app. The engine starts with the first PDF (~1 s) and is then reused, so later PDFs open almost instantly; it shuts down after 5 idle minutes. Links in a PDF open in your normal browser. If Edge's engine can't start, a built-in pdfium page viewer takes over
 - **Text** (`.txt .md .log .csv .json`): read-only dark viewer
 - Word, Excel and other documents open in their default app
 
@@ -34,7 +34,7 @@ Built with Python + tkinter, on top of yt-dlp, gallery-dl, mpv, ffmpeg, Pillow, 
 - `.` / `,` step one frame forward / back, frame-accurate
 - `space` play/pause · `←/→` skip 5 s · `↑/↓` volume
 - `[` / `]` speed · `Backspace` reset speed · `m` mute
-- `f` or double-click for fullscreen · `Esc` to exit fullscreen
+- `f` or double-click for fullscreen · `Esc` to exit fullscreen, or to go back
 
 ## Requirements
 
@@ -67,8 +67,8 @@ Built with Python + tkinter, on top of yt-dlp, gallery-dl, mpv, ffmpeg, Pillow, 
 | File | What it is |
 |---|---|
 | `snapgrab.pyw` | Main app: window, downloader, routing between engines |
-| `snapgrab_media.py` | Libraries (virtualized grids, folder tabs, thumbnails), mpv/VLC players, image and text viewers |
-| `snapgrab_pdf.py` | PDF viewer window (Edge WebView2), reused for every PDF |
+| `snapgrab_media.py` | Libraries (virtualized grids, folder tabs, thumbnails), in-window mpv player, image, text and PDF viewers (Edge WebView2 + pdfium fallback) |
+| `snapgrab_pdf.py` | Separate PDF viewer window (Edge WebView2) — last-resort fallback |
 | `snapgrab_embed.py` | Login-free Instagram fetcher (hidden browser window reads the public embed player) |
 | `snapgrab.ico` | App icon |
 

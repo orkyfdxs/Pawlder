@@ -12,6 +12,7 @@ import sys
 import shutil
 import subprocess
 import threading
+import time
 import tkinter as tk
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -39,6 +40,9 @@ PREVIEW_TEXT_EXTS = (".txt", ".md", ".log")
 PDF_HELPER = os.path.join(SCRIPT_DIR, "snapgrab_pdf.py")
 CACHE_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or SCRIPT_DIR,
                          "SnapGrab", "thumbs")
+# pdfium must never be called from two threads at once (not even for
+# different documents): Docs thumbnails and the PDF viewer share this lock
+_PDFIUM_LOCK = threading.RLock()
 
 # ── graphite theme (mirrors snapgrab.pyw) ──────────────────────────────
 class T:
@@ -470,11 +474,256 @@ class MpvPlayer(tk.Toplevel):
             self.toggle_fullscreen()
 
     def _close(self):
+        th = _mpv_terminate_bg(self.mpv)
+        self.mpv = None
+        self.withdraw()
+        _destroy_when_done(self, th)
+
+
+def _mpv_terminate_bg(player):
+    """Shut mpv down on a WORKER thread. mpv's terminate un-initialises COM
+    on whatever thread calls it — on the UI thread that flipped Pawlder into
+    multi-threaded COM mode, after which the Edge PDF viewer (and anything
+    else that needs the UI thread single-threaded) refused to start."""
+    if player is None:
+        return None
+
+    def run():
         try:
-            self.mpv.terminate()
+            player.terminate()
         except Exception:
             pass
-        self.destroy()
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    return th
+
+
+def _destroy_when_done(widget, thread):
+    """Destroy the (already hidden) widget once mpv has let go of its window."""
+    def check():
+        if thread is not None and thread.is_alive():
+            widget.after(30, check)
+        else:
+            try:
+                widget.destroy()
+            except Exception:
+                pass
+    check()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  In-window overlay: viewers (video/music player, images, text) open INSIDE
+#  the main window instead of as popups. Covers the whole window; "← Back",
+#  Esc or the window's ✕ return to the library exactly where it was.
+# ═══════════════════════════════════════════════════════════════════════
+class Overlay(tk.Frame):
+    _current = None                      # only one viewer open at a time
+    # The window title already names the file, and Esc / the window's ✕ go
+    # back, so the in-window "← Back · name" bar is off (more room for the
+    # content). Flip to True to bring it back.
+    SHOW_BAR = False
+
+    def __init__(self, top, title, bg):
+        if Overlay._current is not None:
+            Overlay._current.close()
+        super().__init__(top, bg=bg)
+        self.top = top
+        self._fullscreen = False
+        self._was_zoomed = False
+        self._closed = False
+        self._old_title = top.title()
+        try:
+            self._old_close = top.protocol("WM_DELETE_WINDOW")
+        except Exception:
+            self._old_close = ""
+        try:   # the library's wheel binding shouldn't scroll the grid underneath
+            top.unbind_all("<MouseWheel>")
+        except Exception:
+            pass
+
+        # slim top bar: back + name (hidden in fullscreen)
+        self.bar = tk.Frame(self, bg=T.BG, height=34)
+        if self.SHOW_BAR:
+            self.bar.pack(side="top", fill="x")
+        self.bar.pack_propagate(False)
+        back = tk.Label(self.bar, text="←  Back", font=("Segoe UI Semibold", 9),
+                        bg=T.BG, fg=T.SUB, cursor="hand2", padx=12)
+        back.pack(side="left", fill="y", padx=(12, 0))
+        back.bind("<Button-1>", lambda e: self.close())
+        back.bind("<Enter>", lambda e: back.config(fg=T.TEXT))
+        back.bind("<Leave>", lambda e: back.config(fg=T.SUB))
+        self._title_lbl = tk.Label(self.bar, text="", font=F_SMALL, bg=T.BG,
+                                   fg=T.MUTED, anchor="w")
+        self._title_lbl.pack(side="left", fill="x", expand=True, padx=(6, 12))
+
+        self.body = tk.Frame(self, bg=bg)
+        self.body.pack(fill="both", expand=True)
+        self.place(x=0, y=0, relwidth=1, relheight=1)
+        self.lift()
+        self.bind("<Escape>", lambda e: self._esc())
+        self.bind("<Destroy>", self._on_destroy_evt)
+        # window ✕ closes the viewer (like the old popups did), not the app
+        try:
+            top.protocol("WM_DELETE_WINDOW", self.close)
+        except Exception:
+            pass
+        Overlay._current = self
+        self.set_title(title)
+        self.update_idletasks()
+
+    def adopt_keys(self):
+        """Make key bindings made with self.bind() work while focus is on any
+        widget inside the viewer (what a Toplevel did for free). They never
+        reach the rest of the app (e.g. the Download page's text fields)."""
+        tag = str(self)
+        stack = list(self.winfo_children())
+        while stack:
+            w = stack.pop()
+            stack.extend(w.winfo_children())
+            tags = w.bindtags()
+            if tag not in tags:
+                w.bindtags(tags[:1] + (tag,) + tags[1:])
+        self.focus_set()
+
+    def set_title(self, text):
+        self._title_lbl.config(text=text)
+        try:
+            self.top.title(f"{text}  —  Pawlder")
+        except Exception:
+            pass
+
+    def toggle_fullscreen(self):
+        self._fullscreen = not self._fullscreen
+        top = self.top
+        if self._fullscreen:
+            try:
+                self._was_zoomed = (top.state() == "zoomed")
+            except Exception:
+                self._was_zoomed = False
+            self.bar.pack_forget()
+            top.attributes("-fullscreen", True)
+        else:
+            top.attributes("-fullscreen", False)
+            if self._was_zoomed:
+                top.state("zoomed")
+            if self.SHOW_BAR:
+                self.bar.pack(side="top", fill="x", before=self.body)
+        self.focus_set()
+
+    def _esc(self):
+        if self._fullscreen:
+            self.toggle_fullscreen()
+        else:
+            self.close()
+
+    def on_close(self):
+        """Subclass cleanup (stop playback, timers). Called exactly once."""
+
+    def _shutdown(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.on_close()
+        except Exception:
+            pass
+        try:
+            self.top.protocol("WM_DELETE_WINDOW", self._old_close)
+        except Exception:
+            pass
+        if Overlay._current is self:
+            Overlay._current = None
+
+    def _on_destroy_evt(self, e):
+        if e.widget is self:             # app closed while a viewer was open
+            self._shutdown()
+
+    def close(self):
+        if self._closed:
+            return
+        if self._fullscreen:
+            self.toggle_fullscreen()
+        self._shutdown()
+        top = self.top
+        try:
+            top.title(self._old_title)
+        except Exception:
+            pass
+        th = getattr(self, "_bg_thread", None)
+        if th is not None and th.is_alive():
+            self.place_forget()            # library back instantly; the frame
+            _destroy_when_done(self, th)   # goes once mpv has let go of it
+        else:
+            self.destroy()
+        # hand mouse + keys back to whatever is under the pointer (the grid),
+        # so the wheel scrolls immediately without wiggling the mouse
+        try:
+            w = top.winfo_containing(*top.winfo_pointerxy())
+            if w is not None:
+                w.event_generate("<Enter>")
+                w.focus_set()
+        except Exception:
+            pass
+
+
+def _close_overlay():
+    """Close whatever viewer is open (used when one fails half-built, so a
+    blank overlay never stays over the library)."""
+    if Overlay._current is not None:
+        try:
+            Overlay._current.close()
+        except Exception:
+            Overlay._current = None
+
+
+class InlinePlayer(Overlay):
+    """mpv inside the main window."""
+    # same mpv helpers as the popup player
+    _c, _osd, _vol, _speed = MpvPlayer._c, MpvPlayer._osd, MpvPlayer._vol, MpvPlayer._speed
+
+    def __init__(self, top, path):
+        import mpv
+        self.mpv = None
+        super().__init__(top, os.path.basename(path), "#000000")
+        self.path = path
+        self.video = tk.Frame(self.body, bg="#000000")
+        self.video.pack(fill="both", expand=True)
+        self.update_idletasks()
+        try:
+            self.mpv = mpv.MPV(
+                wid=str(self.video.winfo_id()),
+                vo="gpu", osc=True, keep_open="yes", ytdl=False,
+                cursor_autohide=1200,
+                audio_display="embedded-first",
+                input_default_bindings=False, input_vo_keyboard=False)
+            self.mpv.play(path)
+        except Exception:
+            self.close()                 # don't leave a black overlay behind
+            raise
+
+        keys = {
+            "<space>":        lambda e: self._c("cycle", "pause"),
+            "<period>":       lambda e: self._c("frame-step"),
+            "<comma>":        lambda e: self._c("frame-back-step"),
+            "<Right>":        lambda e: self._c("seek", 5),
+            "<Left>":         lambda e: self._c("seek", -5),
+            "<Up>":           lambda e: self._vol(5),
+            "<Down>":         lambda e: self._vol(-5),
+            "<bracketright>": lambda e: self._speed(1.1),
+            "<bracketleft>":  lambda e: self._speed(0.9),
+            "<BackSpace>":    lambda e: self._speed(0),
+            "<m>":            lambda e: self._c("cycle", "mute"),
+            "<f>":            lambda e: self.toggle_fullscreen(),
+        }
+        for seq, fn in keys.items():
+            self.bind(seq, fn)
+        self.video.bind("<Double-Button-1>", lambda e: self.toggle_fullscreen())
+        self.video.bind("<Button-1>", lambda e: self.focus_set(), add="+")
+        self.adopt_keys()
+
+    def on_close(self):
+        self._bg_thread = _mpv_terminate_bg(self.mpv)   # never on the UI thread
+        self.mpv = None
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1032,7 +1281,7 @@ class LibraryView(tk.Frame):
 
         def on_ctx(e, s=slot):
             if s["path"]:
-                self._show_ctx(e, s["path"])
+                self._secondary_click(e, s["path"])
 
         def on_enter(e, s=slot):
             c.itemconfigure(s["rect"], fill=T.CARD_HI)
@@ -1313,14 +1562,15 @@ class LibraryView(tk.Frame):
             import pypdfium2 as pdfium
         except Exception:
             return None, 0
-        doc = pdfium.PdfDocument(path)
-        try:
-            pages = len(doc)
-            page = doc[0]
-            _w, h = page.get_size()
-            im = page.render(scale=(self.THUMB_H * 2) / max(h, 1)).to_pil().convert("RGB")
-        finally:
-            doc.close()
+        with _PDFIUM_LOCK:       # pdfium is not thread-safe (viewer renders too)
+            doc = pdfium.PdfDocument(path)
+            try:
+                pages = len(doc)
+                page = doc[0]
+                _w, h = page.get_size()
+                im = page.render(scale=(self.THUMB_H * 2) / max(h, 1)).to_pil().convert("RGB")
+            finally:
+                doc.close()
         try:
             im.save(os.path.join(CACHE_DIR, f"{key}.{pages}.jpg"), quality=85)
         except Exception:
@@ -1446,6 +1696,15 @@ class LibraryView(tk.Frame):
         return os.path.join(self.thumb_dir, key)
 
     # ── actions ─────────────────────────────────────────────────────────
+    def _secondary_click(self, event, path):
+        """Secondary mouse button on a card = show the file in its folder
+        straight away. Shift + that click opens the full menu (copy path,
+        etc.)."""
+        if event.state & 0x0001:                     # Shift held
+            self._show_ctx(event, path)
+        else:
+            self._reveal(path)
+
     def _show_ctx(self, event, path):
         m = tk.Menu(self, tearoff=0, bg=T.CARD, fg=T.TEXT,
                     activebackground=T.CARD_HI, activeforeground=T.TEXT,
@@ -1495,6 +1754,7 @@ class LibraryView(tk.Frame):
                 ImageViewer(self.winfo_toplevel(), list(self._files),
                             self._files.index(path))
             except Exception:
+                _close_overlay()
                 self._open_external(path)
             return
         if self.on_play:
@@ -1504,7 +1764,12 @@ class LibraryView(tk.Frame):
         # system default player.
         if MPV_OK:
             try:
-                MpvPlayer(self.winfo_toplevel(), path)
+                InlinePlayer(self.winfo_toplevel(), path)   # inside this window
+                return
+            except Exception:
+                _close_overlay()
+            try:
+                MpvPlayer(self.winfo_toplevel(), path)      # popup fallback
                 return
             except Exception:
                 pass
@@ -1524,6 +1789,19 @@ class LibraryView(tk.Frame):
         anything else (Word, Excel, …) → its normal app."""
         ext = os.path.splitext(path)[1].lower()
         top = self.winfo_toplevel()
+        if ext == ".pdf":
+            # Edge's viewer inside this window; if that engine can't start it
+            # falls back by itself (built-in renderer → PDF window → app)
+            try:
+                EdgePdfViewer(top, path)
+                return
+            except Exception:
+                _close_overlay()
+            try:
+                PdfViewer(top, path)                 # built-in page renderer
+                return
+            except Exception:
+                _close_overlay()                     # e.g. password-protected
         if ext == ".pdf" and open_pdf(top, path):
             # first PDF starts the viewer (~1 s); later ones reuse it (fast)
             try:
@@ -1537,7 +1815,7 @@ class LibraryView(tk.Frame):
                 TextViewer(top, path)
                 return
             except Exception:
-                pass
+                _close_overlay()
         self._open_external(path)
 
     def _on_destroy(self, e=None):
@@ -1805,31 +2083,21 @@ def _pdf_send(path, geo):
             pass
 
 
-class TextViewer(tk.Toplevel):
-    """Read-only viewer for .txt/.md/.log/.csv/.json (first 2 MB)."""
+class TextViewer(Overlay):
+    """Read-only viewer for .txt/.md/.log/.csv/.json (first 2 MB), inside
+    the main window."""
     LIMIT = 2 * 1024 * 1024
 
     def __init__(self, parent, path):
-        super().__init__(parent)
-        self.title(os.path.basename(path))
-        self.configure(bg=T.BG)
-        self.minsize(420, 300)
-        center_window(self, parent, wfrac=0.56, hfrac=0.74)
-        try:
-            ico = os.path.join(SCRIPT_DIR, "snapgrab.ico")
-            if os.path.isfile(ico):
-                self.iconbitmap(ico)
-        except Exception:
-            pass
-
         body = read_text(path, self.LIMIT + 1) or ""
+        super().__init__(parent, os.path.basename(path), T.BG)
         cut = len(body) > self.LIMIT
         if cut:
             body = body[:self.LIMIT]
 
         # prose wraps; data files (csv/json/log) keep their lines intact
         wrap = "word" if path.lower().endswith((".txt", ".md")) else "none"
-        frame = tk.Frame(self, bg=T.BG)
+        frame = tk.Frame(self.body, bg=T.BG)
         frame.pack(fill="both", expand=True)
         self.text = tk.Text(frame, bg=T.SURFACE, fg=T.TEXT, insertbackground=T.TEXT,
                             selectbackground="#3f3f46", relief="flat", bd=0,
@@ -1858,15 +2126,648 @@ class TextViewer(tk.Toplevel):
                     return "break"
                 return None
             if e.keysym in ("Up", "Down", "Left", "Right", "Prior", "Next",
-                            "Home", "End"):
+                            "Home", "End", "Escape"):
                 return None
             return "break"
         self.text.bind("<Key>", guard)
         self.text.bind("<<Paste>>", lambda e: "break")
         self.text.bind("<<Cut>>", lambda e: "break")
-        self.bind("<Escape>", lambda e: self.destroy())
+        self.adopt_keys()                # Esc → back (from the base)
         self.text.focus_set()
 
+
+class PdfViewer(Overlay):
+    """PDF inside the main window, drawn with pdfium (no browser engine).
+    Continuous scroll; only the pages on screen (± 1) are rendered, in a
+    background thread. Wheel = scroll, Ctrl+wheel / + − = zoom, 0 = reset,
+    PgUp/PgDn/Space = page, Home/End, F = fullscreen, Esc = back.
+    No text selection/search/links — "Open in PDF window" has those."""
+    BG = "#1b1b1f"
+    PAD, GAP = 24, 14
+    BASE_W = 1000             # page width at 100 % (or the window, if narrower)
+    MAX_PX = 2400             # widest a page is ever rendered (RAM guard)
+
+    def __init__(self, parent, path):
+        import pypdfium2 as pdfium
+        with _PDFIUM_LOCK:
+            doc = pdfium.PdfDocument(path)
+            try:
+                sizes = [doc.get_page_size(i) for i in range(len(doc))]
+            except Exception:
+                doc.close()
+                raise
+        if not sizes:
+            with _PDFIUM_LOCK:
+                doc.close()
+            raise ValueError("empty PDF")
+        self.doc, self.sizes, self.path = doc, sizes, path
+        self._maxw_pt = max(w for w, h in sizes)
+        self.zoom = 1.0
+        self.s = 1.0                      # px per pt (current layout)
+        self.tops, self._x0 = [], []
+        self._imgs = {}                   # page -> (scale, PhotoImage, item)
+        self._want, self._results = [], []
+        self._wlock = threading.Lock()
+        self._evt = threading.Event()
+        self._stop = False
+        self._polling = False
+        self._view_job = self._resize_job = None
+        self._last_w = 0
+        super().__init__(parent, os.path.basename(path), self.BG)
+
+        # bar extras (right side): page counter + the old full viewer
+        ext = tk.Label(self.bar, text="Open in PDF window  ↗", font=F_SMALL,
+                       bg=T.BG, fg=T.MUTED, cursor="hand2", padx=12)
+        ext.pack(side="right", fill="y", padx=(0, 12), before=self._title_lbl)
+        ext.bind("<Button-1>", lambda e: self._open_window())
+        ext.bind("<Enter>", lambda e: ext.config(fg=T.TEXT))
+        ext.bind("<Leave>", lambda e: ext.config(fg=T.MUTED))
+        self._page_lbl = tk.Label(self.bar, text="", font=F_SMALL, bg=T.BG,
+                                  fg=T.SUB, padx=8)
+        self._page_lbl.pack(side="right", fill="y", before=self._title_lbl)
+
+        self.cv = tk.Canvas(self.body, bg=self.BG, highlightthickness=0, bd=0,
+                            yscrollincrement=40, xscrollincrement=40)
+        self.sb = SlimScrollbar(self.body, command=self.cv.yview, bg=self.BG)
+        self.sb.pack(side="right", fill="y")
+        self.cv.pack(side="left", fill="both", expand=True)
+        self.cv.configure(yscrollcommand=self._on_yscroll)
+
+        self.cv.bind("<MouseWheel>", self._on_wheel)
+        self.cv.bind("<Control-MouseWheel>", self._on_ctrl_wheel)
+        self.cv.bind("<Shift-MouseWheel>",
+                     lambda e: self.cv.xview_scroll(-3 if e.delta > 0 else 3, "units"))
+        self.cv.bind("<Configure>", self._on_resize)
+        page = lambda d: self.cv.yview_scroll(d, "pages")
+        keys = {"<Down>": lambda e: self.cv.yview_scroll(2, "units"),
+                "<Up>": lambda e: self.cv.yview_scroll(-2, "units"),
+                "<Next>": lambda e: page(1), "<Prior>": lambda e: page(-1),
+                "<space>": lambda e: page(1), "<Shift-space>": lambda e: page(-1),
+                "<Home>": lambda e: self.cv.yview_moveto(0),
+                "<End>": lambda e: self.cv.yview_moveto(1),
+                "<plus>": lambda e: self._zoom_by(1.2), "<equal>": lambda e: self._zoom_by(1.2),
+                "<minus>": lambda e: self._zoom_by(1 / 1.2),
+                "<Key-0>": lambda e: self._set_zoom(1.0),
+                "<f>": lambda e: self.toggle_fullscreen(),
+                "<F11>": lambda e: self.toggle_fullscreen()}
+        for k, fn in keys.items():
+            self.bind(k, fn)
+
+        threading.Thread(target=self._worker, daemon=True).start()
+        self.update_idletasks()
+        self._layout()
+        self.adopt_keys()
+
+    # ── layout ──────────────────────────────────────────────────────────
+    def _fit_w(self):
+        cw = max(200, self.cv.winfo_width())
+        return max(120, min(cw - 2 * self.PAD, self.BASE_W))
+
+    def _layout(self, anchor=None):
+        """Place all pages for the current zoom. anchor=(page, offset_pt,
+        screen_y) keeps that point of the document under that screen y."""
+        cw = max(200, self.cv.winfo_width())
+        self._last_w = cw
+        pw = min(self._fit_w() * self.zoom, self.MAX_PX)
+        self.s = s = pw / self._maxw_pt
+        total_w = max(cw, pw + 2 * self.PAD)
+        y, self.tops, self._x0 = self.PAD, [], []
+        cv = self.cv
+        cv.delete("page")
+        for w, h in self.sizes:
+            x0 = (total_w - w * s) / 2
+            self.tops.append(y)
+            self._x0.append(x0)
+            cv.create_rectangle(x0, y, x0 + w * s, y + h * s, fill="#ffffff",
+                                outline="#2a2a30", tags="page")
+            y += h * s + self.GAP
+        self._total_h = y - self.GAP + self.PAD
+        for i, (_s, _ph, item) in self._imgs.items():
+            cv.delete(item)
+        self._imgs.clear()
+        cv.configure(scrollregion=(0, 0, total_w, self._total_h))
+        if anchor is not None:
+            i, off, sy = anchor
+            ny = self.tops[i] + off * s - sy
+            cv.yview_moveto(max(0.0, ny) / self._total_h)
+        cv.xview_moveto(max(0.0, (total_w - cw) / 2) / total_w)
+        self._schedule_view()
+
+    def _anchor_at(self, sy):
+        import bisect
+        cy = self.cv.canvasy(sy)
+        i = max(0, bisect.bisect_right(self.tops, cy) - 1)
+        return (i, (cy - self.tops[i]) / self.s, sy)
+
+    def _on_resize(self, e):
+        if abs(e.width - self._last_w) < 2:
+            return
+        if self._resize_job:
+            self.after_cancel(self._resize_job)
+        self._resize_job = self.after(80, lambda: self._layout(self._anchor_at(0)))
+
+    def _set_zoom(self, z, at_y=None):
+        z = max(0.4, min(z, self.MAX_PX / self._fit_w()))
+        if abs(z - self.zoom) < 1e-3:
+            return
+        sy = self.cv.winfo_height() / 2 if at_y is None else at_y
+        anchor = self._anchor_at(sy)
+        self.zoom = z
+        self._layout(anchor)
+
+    def _zoom_by(self, f, at_y=None):
+        self._set_zoom(self.zoom * f, at_y)
+
+    # ── scrolling / visible pages ───────────────────────────────────────
+    def _on_wheel(self, e):
+        self.cv.yview_scroll(-3 if e.delta > 0 else 3, "units")
+
+    def _on_ctrl_wheel(self, e):
+        self._zoom_by(1.15 if e.delta > 0 else 1 / 1.15, at_y=e.y)
+        return "break"
+
+    def _on_yscroll(self, a, b):
+        self.sb.set(a, b)
+        self._schedule_view()
+
+    def _schedule_view(self):
+        if self._view_job is None and not self._closed:
+            self._view_job = self.after_idle(self._update_view)
+
+    def _update_view(self):
+        import bisect
+        self._view_job = None
+        if self._closed or not self.tops:
+            return
+        top = self.cv.canvasy(0)
+        bot = top + self.cv.winfo_height()
+        first = max(0, bisect.bisect_right(self.tops, top) - 1)
+        last = max(first, bisect.bisect_right(self.tops, bot) - 1)
+        n = len(self.sizes)
+        cur = bisect.bisect_right(self.tops, top + self.cv.winfo_height() / 3) - 1
+        z = f"   ·   {round(self.zoom * 100)}%" if abs(self.zoom - 1) > 1e-3 else ""
+        txt = f"Page {max(0, cur) + 1} / {n}{z}"
+        if txt != getattr(self, "_page_txt", None):     # no bar: show it in
+            self._page_txt = txt                        # the window title
+            self._page_lbl.config(text=txt)
+            try:
+                self.top.title(f"{os.path.basename(self.path)}  ·  {txt}  —  Pawlder")
+            except Exception:
+                pass
+        visible = list(range(first, last + 1))
+        want = visible + [p for p in (last + 1, first - 1) if 0 <= p < n]
+        keep = set(want)
+        for i in [i for i in self._imgs if i not in keep]:      # free RAM
+            self.cv.delete(self._imgs.pop(i)[2])
+        todo = [(i, self.s) for i in want
+                if i not in self._imgs or self._imgs[i][0] != self.s]
+        with self._wlock:
+            self._want = todo
+            if todo:
+                self._evt.set()
+        if todo:
+            self._start_poll()
+
+    # ── rendering (worker thread; pdfium only ever touched under the lock)
+    def _worker(self):
+        while True:
+            self._evt.wait()
+            if self._stop:
+                break
+            with self._wlock:
+                if not self._want:
+                    self._evt.clear()
+                    continue
+                i, s = self._want.pop(0)
+            try:
+                with _PDFIUM_LOCK:
+                    page = self.doc[i]
+                    try:
+                        im = page.render(scale=s).to_pil()
+                    finally:
+                        page.close()
+                if im.mode != "RGB":
+                    im = im.convert("RGB")
+            except Exception:
+                im = None
+            with self._wlock:
+                self._results.append((i, s, im))
+        with _PDFIUM_LOCK:
+            try:
+                self.doc.close()
+            except Exception:
+                pass
+
+    def _start_poll(self):
+        if not self._polling:
+            self._polling = True
+            self.after(15, self._poll)
+
+    def _poll(self):
+        if self._closed:
+            return
+        from PIL import ImageTk
+        with self._wlock:
+            res, self._results = self._results, []
+            busy = bool(self._want)
+        for i, s, im in res:
+            if im is None or s != self.s:
+                continue                                # stale zoom level
+            old = self._imgs.pop(i, None)
+            if old:
+                self.cv.delete(old[2])
+            ph = ImageTk.PhotoImage(im)
+            item = self.cv.create_image(self._x0[i], self.tops[i], anchor="nw",
+                                        image=ph, tags="page")
+            self._imgs[i] = (s, ph, item)
+        if busy or res:
+            self.after(15, self._poll)
+        else:
+            self._polling = False
+
+    # ── misc ────────────────────────────────────────────────────────────
+    def _open_window(self):
+        """The full Edge PDF viewer (search, select text, links)."""
+        top, path = self.top, self.path
+        self.close()
+        if not open_pdf(top, path):
+            try:
+                os.startfile(path)
+            except Exception:
+                pass
+
+    def on_close(self):
+        self._stop = True
+        self._evt.set()                 # worker wakes, closes the document
+        for j in (self._view_job, self._resize_job):
+            if j:
+                try:
+                    self.after_cancel(j)
+                except Exception:
+                    pass
+        self._imgs.clear()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Edge's own PDF viewer INSIDE the main window (WebView2 hosted directly in
+#  a tk frame — same toolbar, search, select, print as Edge).
+#  Everything runs on the UI thread: WebView2's async results are POLLED
+#  with after() and its events only schedule work with after(0). (The old
+#  separate viewer froze when .NET was touched from another thread.)
+#  One engine is shared: after a PDF closes it is parked hidden and reused,
+#  so only the first PDF of a session pays the start-up (~1 s); it is shut
+#  down after EDGE_IDLE seconds unused to give the memory back.
+# ═══════════════════════════════════════════════════════════════════════
+EDGE_IDLE = 300
+import collections
+_EDGE = {"mod": None, "env": None, "env_task": None, "ctl": None,
+         "ctl_task": None, "holder": None, "want": None, "idle": None,
+         "polling": False, "t0": 0.0, "events": collections.deque()}
+
+
+def _edge_mod():
+    """Load .NET + the WebView2 wrapper once (~0.6 s the first time)."""
+    if _EDGE["mod"] is not None:
+        return _EDGE["mod"]
+    import ctypes
+    from types import SimpleNamespace
+    hr = ctypes.windll.ole32.CoInitializeEx(None, 2)          # WebView2 needs STA
+    if hr == -2147417850:                                     # RPC_E_CHANGED_MODE
+        raise RuntimeError("UI thread is not single-threaded COM")
+    wv = os.path.join(_LIBS, "webview", "lib")
+    native = os.path.join(wv, "runtimes", "win-x64", "native")
+    if os.path.isdir(native):
+        try:
+            os.add_dll_directory(native)
+        except Exception:
+            pass
+        os.environ["PATH"] = native + os.pathsep + os.environ.get("PATH", "")
+    import clr
+    clr.AddReference("System.Drawing")
+    clr.AddReference(os.path.join(wv, "Microsoft.Web.WebView2.Core.dll"))
+    from Microsoft.Web.WebView2.Core import (CoreWebView2Environment,
+                                             CoreWebView2MoveFocusReason,
+                                             CoreWebView2KeyEventKind)
+    from System import IntPtr
+    from System.Drawing import Rectangle, Color
+    _EDGE["mod"] = SimpleNamespace(Env=CoreWebView2Environment, IntPtr=IntPtr,
+                                   Rect=Rectangle, Color=Color,
+                                   Focus=CoreWebView2MoveFocusReason,
+                                   KeyKind=CoreWebView2KeyEventKind)
+    return _EDGE["mod"]
+
+
+def _edge_request(viewer):
+    """A viewer wants the browser: hand it over now, or start it."""
+    E = _EDGE
+    E["want"] = viewer
+    if E["idle"]:
+        try:   # cancel on the widget that scheduled it (else tk errors at exit)
+            E["holder"].after_cancel(E["idle"])
+        except Exception:
+            pass
+        E["idle"] = None
+    if E["ctl"] is not None:
+        viewer._attach(E["ctl"])
+        return
+    m = _edge_mod()
+    root = viewer.top
+    if E["holder"] is None or not E["holder"].winfo_exists():
+        # never-mapped frame: the engine's home while no PDF is showing
+        E["holder"] = tk.Frame(root, width=1, height=1)
+    if E["env_task"] is None and E["env"] is None:
+        store = os.path.join(os.environ.get("LOCALAPPDATA") or SCRIPT_DIR,
+                             "SnapGrab", "webview-inline")
+        E["env_task"] = m.Env.CreateAsync(None, store, None)
+    E["t0"] = time.perf_counter()
+    if not E["polling"]:
+        E["polling"] = True
+        root.after(5, _edge_poll)
+
+
+def _edge_log(msg):
+    """Why the Edge viewer couldn't be used -> snapgrab_debug.txt."""
+    try:
+        import datetime
+        with open(os.path.join(SCRIPT_DIR, "snapgrab_debug.txt"), "a",
+                  encoding="utf-8") as f:
+            f.write(f"{datetime.datetime.now():%H:%M:%S} edge-pdf: {msg}" + "\n")
+    except Exception:
+        pass
+
+
+def _edge_fail(why=""):
+    E = _EDGE
+    _edge_log(f"fell back to built-in viewer: {why}")
+    E["env"] = E["env_task"] = E["ctl"] = E["ctl_task"] = None
+    E["polling"] = False
+    v, E["want"] = E["want"], None
+    if v is not None and not v._closed:
+        v._fallback()
+
+
+def _edge_poll():
+    E = _EDGE
+    holder = E["holder"]
+    try:
+        if E["env"] is None:
+            t = E["env_task"]
+            if t.IsCompleted:
+                if t.IsFaulted or t.IsCanceled:
+                    return _edge_fail(f"environment: {t.Exception}")
+                E["env"], E["env_task"] = t.Result, None
+                m = _edge_mod()
+                E["ctl_task"] = E["env"].CreateCoreWebView2ControllerAsync(
+                    m.IntPtr(holder.winfo_id()))
+        elif E["ctl"] is None:
+            t = E["ctl_task"]
+            if t.IsCompleted:
+                if t.IsFaulted or t.IsCanceled:
+                    return _edge_fail(f"controller: {t.Exception}")
+                E["ctl"], E["ctl_task"] = t.Result, None
+                _edge_setup(E["ctl"])
+                E["polling"] = False
+                v = E["want"]
+                if v is not None and not v._closed:
+                    v._attach(E["ctl"])
+                else:
+                    _edge_park()
+                return
+        if time.perf_counter() - E["t0"] > 12:                 # never came up
+            return _edge_fail("timed out after 12 s")
+    except Exception as e:
+        return _edge_fail(repr(e))
+    holder.after(10, _edge_poll)
+
+
+def _edge_setup(ctl):
+    """Once per engine: dark background + event handlers.
+    RULE: these handlers run inside a .NET callback while tkinter is in the
+    middle of its own event processing — calling ANY tkinter function here
+    corrupts tkinter's thread state and Python aborts (seen in testing).
+    So they only answer WebView2 (Cancel/Handled) and append a note to a
+    plain deque; EdgePdfViewer._drain() acts on the notes from a tk timer."""
+    m = _edge_mod()
+    ctl.DefaultBackgroundColor = m.Color.FromArgb(255, 51, 51, 51)
+    core = ctl.CoreWebView2
+    try:
+        s = core.Settings
+        s.AreDevToolsEnabled = False
+        s.IsStatusBarEnabled = False
+    except Exception:
+        pass
+    q = _EDGE["events"]
+
+    def on_nav(s, e):
+        try:
+            uri = str(e.Uri)
+            if uri.lower().startswith(("file:", "about:", "edge:", "data:")):
+                return
+            e.Cancel = True                    # links in a PDF never load
+            q.append(("link", uri))            # inside Pawlder
+        except Exception:
+            pass
+
+    def on_new_window(s, e):
+        try:
+            e.Handled = True
+            q.append(("link", str(e.Uri)))
+        except Exception:
+            pass
+
+    def on_fullscreen(s, e):
+        try:
+            q.append(("fs", bool(core.ContainsFullScreenElement)))
+        except Exception:
+            pass
+
+    def on_key(s, e):
+        try:
+            if e.KeyEventKind != m.KeyKind.KeyDown:
+                return
+            vk = int(e.VirtualKey)
+            if vk == 27 and not core.ContainsFullScreenElement:   # Esc
+                e.Handled = True
+                q.append(("esc", None))
+            elif vk == 0x7A:                                      # F11
+                e.Handled = True
+                q.append(("f11", None))
+        except Exception:
+            pass
+
+    def on_crash(s, e):
+        q.append(("crash", None))
+
+    core.NavigationStarting += on_nav
+    core.NewWindowRequested += on_new_window
+    core.ContainsFullScreenElementChanged += on_fullscreen
+    core.ProcessFailed += on_crash
+    ctl.AcceleratorKeyPressed += on_key
+    _EDGE["handlers"] = (on_nav, on_new_window, on_fullscreen, on_key, on_crash)
+
+
+def _edge_park():
+    """Hide the engine in the holder; shut it down if unused for a while."""
+    E = _EDGE
+    ctl = E["ctl"]
+    E["want"] = None
+    if ctl is None:
+        return
+    m = _edge_mod()
+    try:
+        ctl.IsVisible = False
+        ctl.CoreWebView2.Navigate("about:blank")       # frees the PDF
+        ctl.ParentWindow = m.IntPtr(E["holder"].winfo_id())
+    except Exception:
+        _edge_shutdown()
+        return
+    try:
+        E["idle"] = E["holder"].after(EDGE_IDLE * 1000, _edge_shutdown)
+    except Exception:
+        pass
+
+
+def _edge_shutdown():
+    E = _EDGE
+    ctl, E["ctl"], E["env"] = E["ctl"], None, None
+    E["idle"] = None
+    if ctl is not None:
+        try:
+            ctl.Close()
+        except Exception:
+            pass
+
+
+class EdgePdfViewer(Overlay):
+    """Microsoft Edge's PDF viewer, inside the main window."""
+    BG = "#333333"
+
+    def __init__(self, parent, path):
+        super().__init__(parent, os.path.basename(path), self.BG)
+        self.path = path
+        self._ctl = None
+        self.host = tk.Frame(self.body, bg=self.BG)
+        self.host.pack(fill="both", expand=True)
+        self._msg = tk.Label(self.host, text="Opening…", font=F_SMALL,
+                             bg=self.BG, fg="#a1a1aa")
+        self._msg.place(relx=0.5, rely=0.4, anchor="center")
+        self.host.bind("<Configure>", lambda e: self._fit())
+        self.adopt_keys()
+        self.update_idletasks()
+        # start (or reuse) the engine once this frame is on screen
+        self.after(1, self._start)
+
+    def _start(self):
+        if self._closed:
+            return
+        try:
+            _edge_request(self)
+        except Exception as e:
+            import traceback
+            _edge_log("start failed: " + "".join(
+                traceback.format_exception_only(type(e), e)).strip())
+            self._fallback()
+
+    def _attach(self, ctl):
+        if self._closed:
+            return
+        m = _edge_mod()
+        try:
+            self._ctl = ctl
+            _EDGE["events"].clear()                   # notes from a past PDF
+            ctl.ParentWindow = m.IntPtr(self.host.winfo_id())
+            self._fit()
+            ctl.IsVisible = True
+            from pathlib import Path
+            ctl.CoreWebView2.Navigate(Path(self.path).as_uri())
+            ctl.MoveFocus(m.Focus.Programmatic)       # keys go to the PDF
+            self._msg.place_forget()
+        except Exception as e:
+            _edge_log(f"attach failed: {e!r}")
+            self._ctl = None
+            _edge_shutdown()
+            self._fallback()
+            return
+        self.after(40, self._drain)
+
+    def _drain(self):
+        """Act on what the engine reported (links, Esc, F11, fullscreen,
+        crash) — from a tk timer, never from inside the .NET callback."""
+        if self._closed or self._ctl is None:
+            return
+        q = _EDGE["events"]
+        while q:
+            kind, val = q.popleft()
+            if kind == "link":
+                if val.lower().startswith(("http://", "https://", "mailto:")):
+                    try:
+                        os.startfile(val)          # default browser, not here
+                    except Exception:
+                        pass
+            elif kind == "fs":
+                self._edge_fullscreen(val)
+            elif kind == "esc":
+                self._esc()
+            elif kind == "f11":
+                self.toggle_fullscreen()
+            elif kind == "crash":
+                self._ctl = None
+                _edge_shutdown()
+                self._fallback()
+            if self._closed or self._ctl is None:
+                return
+        self.after(40, self._drain)
+
+    def _fit(self):
+        if self._ctl is None:
+            return
+        try:
+            self._ctl.Bounds = _edge_mod().Rect(0, 0, max(1, self.host.winfo_width()),
+                                                max(1, self.host.winfo_height()))
+        except Exception:
+            pass
+
+    def _edge_fullscreen(self, want):
+        """Edge's own fullscreen button → fullscreen the whole window."""
+        if bool(want) != self._fullscreen:
+            self.toggle_fullscreen()
+
+    def toggle_fullscreen(self):
+        super().toggle_fullscreen()
+        self.after(30, self._focus_pdf)          # keep keys in the PDF
+
+    def _focus_pdf(self):
+        try:
+            if self._ctl is not None:
+                self._ctl.MoveFocus(_edge_mod().Focus.Programmatic)
+        except Exception:
+            pass
+
+    def _fallback(self):
+        """Engine unavailable → the built-in page renderer, then the
+        separate PDF window, then the default app."""
+        if self._closed:
+            return
+        top, path = self.top, self.path
+        self.close()
+        try:
+            PdfViewer(top, path)
+            return
+        except Exception:
+            _close_overlay()
+        if not open_pdf(top, path):
+            try:
+                os.startfile(path)
+            except Exception:
+                pass
+
+    def on_close(self):
+        if _EDGE["want"] is self:
+            if self._ctl is not None:
+                _edge_park()
+            else:
+                _EDGE["want"] = None          # still starting: park when ready
+        self._ctl = None
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Image viewer — in-process (no engine to start), neighbours preloaded
@@ -1914,26 +2815,17 @@ def _decode(path, box=None):
     return im, size
 
 
-class ImageViewer(tk.Toplevel):
-    """←/→ next/prev (preloaded), wheel = zoom at cursor, drag = pan,
-    0 = fit, 1 = 100 %, F / double-click = fullscreen, Esc = close."""
+class ImageViewer(Overlay):
+    """Inside the main window. ←/→ next/prev (preloaded), wheel = zoom at
+    cursor, drag = pan, 0 = fit, 1 = 100 %, F / double-click = fullscreen,
+    Esc = back."""
     BG = "#0b0b0d"
 
     def __init__(self, parent, files, index):
-        super().__init__(parent)
-        self.configure(bg=self.BG)
-        self.minsize(480, 320)
-        # big "photo pop-up" (players use 72 %; photos want the screen)
-        # (85 % tall: at 90 % the title bar pushed the bottom under the taskbar)
-        center_window(self, parent, wfrac=0.92, hfrac=0.85)
-        try:
-            ico = os.path.join(SCRIPT_DIR, "snapgrab.ico")
-            if os.path.isfile(ico):
-                self.iconbitmap(ico)
-        except Exception:
-            pass
+        self._anim = None
+        super().__init__(parent, os.path.basename(files[index]), self.BG)
         self.files, self.idx = files, index
-        self.cv = tk.Canvas(self, bg=self.BG, highlightthickness=0, bd=0)
+        self.cv = tk.Canvas(self.body, bg=self.BG, highlightthickness=0, bd=0)
         self.cv.pack(fill="both", expand=True)
         self._img_item = self.cv.create_image(0, 0, anchor="center")
         self._osd = self.cv.create_text(14, 0, anchor="sw", fill="#71717a",
@@ -1951,7 +2843,7 @@ class ImageViewer(tk.Toplevel):
 
         b = {"<Left>": lambda e: self.step(-1), "<Right>": lambda e: self.step(1),
              "<Home>": lambda e: self.go(0), "<End>": lambda e: self.go(len(self.files) - 1),
-             "<Escape>": self._esc, "<f>": lambda e: self._toggle_fs(),
+             "<f>": lambda e: self._toggle_fs(),
              "<F11>": lambda e: self._toggle_fs(), "<Key-0>": lambda e: self._fit(),
              "<Key-1>": lambda e: self._actual(), "<plus>": lambda e: self._zoom_by(1.25),
              "<equal>": lambda e: self._zoom_by(1.25), "<minus>": lambda e: self._zoom_by(0.8)}
@@ -1962,10 +2854,9 @@ class ImageViewer(tk.Toplevel):
         self.cv.bind("<ButtonPress-1>", self._drag_start)
         self.cv.bind("<B1-Motion>", self._drag)
         self.cv.bind("<Configure>", self._on_resize)
-        self.protocol("WM_DELETE_WINDOW", self._close)
         self.update_idletasks()
+        self.adopt_keys()
         self.go(index)
-        self.focus_force()
 
     # ── navigation ───────────────────────────────────────────────────────
     def _view_box(self):
@@ -2037,7 +2928,7 @@ class ImageViewer(tk.Toplevel):
         if self._shown is None:
             self.cv.itemconfigure(self._img_item, image="")
             self._set_osd(f"{os.path.basename(path)}  ·  can't open this image")
-            self.title(os.path.basename(path))
+            self.set_title(os.path.basename(path))
             return
         W, H = self._orig
         if self.zoom is None:
@@ -2086,7 +2977,7 @@ class ImageViewer(tk.Toplevel):
         pct = round((self.zoom or self._fit_scale()) * 100)
         info = (f"{self.idx + 1} / {len(self.files)}   ·   {W} × {H}   ·   {pct}%")
         self._set_osd(info)
-        self.title(f"{os.path.basename(path)}  —  {self.idx + 1} / {len(self.files)}")
+        self.set_title(f"{os.path.basename(path)}  ·  {self.idx + 1} / {len(self.files)}")
 
     def _set_osd(self, text):
         """Small info pill (index · size · zoom) that shows on change and
@@ -2267,16 +3158,12 @@ class ImageViewer(tk.Toplevel):
 
     # ── window ───────────────────────────────────────────────────────────
     def _toggle_fs(self):
-        self._fullscreen = not self._fullscreen
-        self.attributes("-fullscreen", self._fullscreen)
-
-    def _esc(self, e=None):
-        if self._fullscreen:
-            self._toggle_fs()
-        else:
-            self._close()
+        self.toggle_fullscreen()         # whole main window (base class)
 
     def _close(self):
+        self.close()
+
+    def on_close(self):
         self._stop_anim()
         for job in ("_osd_job", "_sharp_job", "_resize_job"):
             j = getattr(self, job, None)
@@ -2285,7 +3172,6 @@ class ImageViewer(tk.Toplevel):
                     self.after_cancel(j)
                 except Exception:
                     pass
-        self.destroy()
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2542,7 +3428,7 @@ class ImageGridView(LibraryView):
 
         def on_ctx(e, s=slot):
             if s["path"]:
-                self._show_ctx(e, s["path"])
+                self._secondary_click(e, s["path"])
 
         def on_enter(e, s=slot):
             if not s["path"]:
