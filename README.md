@@ -6,6 +6,19 @@ A minimal Windows app that downloads videos from **YouTube, Instagram and Pinter
 
 Built with Python + tkinter, on top of yt-dlp, gallery-dl, mpv, ffmpeg, Pillow, pdfium and Edge WebView2.
 
+## Screenshots
+
+![Video library](screenshots/library.webp)
+
+| | |
+|---|---|
+| ![Player](screenshots/player.webp) <br> **Player** — mpv, inside the window | ![Images](screenshots/images.webp) <br> **Images** — Photos-style grid, grouped by month |
+| ![Image viewer](screenshots/image-viewer.webp) <br> **Image viewer** — zoom, pan, ←/→ | ![Music](screenshots/music.webp) <br> **Music** — album art and track lengths |
+| ![Docs](screenshots/docs.webp) <br> **Docs** — PDF covers with page counts | ![PDF](screenshots/pdf.webp) <br> **PDF** — Edge's viewer, inside the app |
+| ![Download](screenshots/download.webp) <br> **Download** — YouTube, Instagram, Pinterest | |
+
+<sub>Videos and Images show generated demo files.</sub>
+
 ## Features
 
 **Downloader**
