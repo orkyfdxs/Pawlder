@@ -47,6 +47,7 @@ Built with Python + tkinter, on top of yt-dlp, gallery-dl, mpv, ffmpeg, Pillow, 
 - `.` / `,` step one frame forward / back, frame-accurate
 - `space` play/pause · `←/→` skip 5 s · `↑/↓` volume
 - `[` / `]` speed · `Backspace` reset speed · `m` mute
+- `l` loop on/off · clips of 30 s or less loop automatically
 - `f` or double-click for fullscreen · `Esc` to exit fullscreen, or to go back
 
 ## Requirements

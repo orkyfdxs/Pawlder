@@ -28,6 +28,7 @@ if os.path.isdir(_LIBS):
 MEDIA_EXTS = (".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi",
               ".mp3", ".m4a", ".flac", ".wav", ".ogg")
 VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi")
+AUTO_LOOP_SECS = 30          # clips this short loop non-stop (L toggles)
 AUDIO_EXTS = (".mp3", ".m4a", ".flac", ".wav", ".ogg", ".opus", ".aac", ".wma")
 IMAGE_EXTS = (".jpg", ".jpeg", ".jfif", ".png", ".gif", ".bmp", ".webp",
               ".tif", ".tiff", ".avif", ".ico")
@@ -429,9 +430,12 @@ class MpvPlayer(tk.Toplevel):
             "<bracketleft>":  lambda e: self._speed(0.9),
             "<BackSpace>":    lambda e: self._speed(0),      # reset speed
             "<m>":            lambda e: self._c("cycle", "mute"),
+            "<l>":            lambda e: self._toggle_loop(),
+            "<L>":            lambda e: self._toggle_loop(),
             "<f>":            lambda e: self.toggle_fullscreen(),
             "<Escape>":       lambda e: self._exit_fs(),
         }
+        self._auto_loop(path)
         for seq, fn in b.items():
             self.bind(seq, fn)
         self.video.bind("<Double-Button-1>", lambda e: self.toggle_fullscreen())
@@ -464,6 +468,39 @@ class MpvPlayer(tk.Toplevel):
             self._osd(f"Speed {self.mpv.speed:.2f}x", 900)
         except Exception:
             pass
+
+    # ── looping: L toggles; clips up to AUTO_LOOP_SECS loop by themselves ──
+    def _set_loop(self, on, quiet=False):
+        try:
+            self.mpv.loop_file = "inf" if on else "no"
+            self._looping = on
+            if not quiet:                       # only when the user pressed L
+                self._osd("Loop on" if on else "Loop off", 900)
+        except Exception:
+            pass
+
+    def _toggle_loop(self):
+        self._set_loop(not getattr(self, "_looping", False))
+
+    def _auto_loop(self, path):
+        """Short clips (renders, reels) loop non-stop; longer videos play
+        once. Length comes from Windows (~3 ms); if it doesn't know, ask
+        mpv once the file has loaded."""
+        self._looping = False
+        d = shell_duration(path) if SHELL_OK else None
+
+        def apply(secs):
+            if secs and 0 < secs <= AUTO_LOOP_SECS and self.mpv is not None:
+                self._set_loop(True, quiet=True)    # silently, no on-screen note
+        if d:
+            self.after(350, lambda: apply(d))
+        else:
+            def ask():
+                try:
+                    apply(self.mpv.duration if self.mpv is not None else None)
+                except Exception:
+                    pass
+            self.after(600, ask)
 
     def toggle_fullscreen(self):
         self._fullscreen = not self._fullscreen
@@ -680,6 +717,8 @@ class InlinePlayer(Overlay):
     """mpv inside the main window."""
     # same mpv helpers as the popup player
     _c, _osd, _vol, _speed = MpvPlayer._c, MpvPlayer._osd, MpvPlayer._vol, MpvPlayer._speed
+    _set_loop, _toggle_loop, _auto_loop = (MpvPlayer._set_loop, MpvPlayer._toggle_loop,
+                                           MpvPlayer._auto_loop)
 
     def __init__(self, top, path):
         import mpv
@@ -713,10 +752,13 @@ class InlinePlayer(Overlay):
             "<bracketleft>":  lambda e: self._speed(0.9),
             "<BackSpace>":    lambda e: self._speed(0),
             "<m>":            lambda e: self._c("cycle", "mute"),
+            "<l>":            lambda e: self._toggle_loop(),
+            "<L>":            lambda e: self._toggle_loop(),
             "<f>":            lambda e: self.toggle_fullscreen(),
         }
         for seq, fn in keys.items():
             self.bind(seq, fn)
+        self._auto_loop(path)
         self.video.bind("<Double-Button-1>", lambda e: self.toggle_fullscreen())
         self.video.bind("<Button-1>", lambda e: self.focus_set(), add="+")
         self.adopt_keys()
